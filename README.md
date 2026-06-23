@@ -6,6 +6,8 @@ Editing 4K, high‑bitrate, or hour‑long footage directly is painful: timeline
 
 Proxy Maker generates those proxies for you, from a simple window anyone can use.
 
+![Proxy Maker converting three camera files in parallel, with live ETAs and checkpoints being saved](docs/screenshot.png)
+
 ---
 
 ## Why this exists
