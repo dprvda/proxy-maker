@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+
+# Generated proxy output / runtime artifacts
+proxies/
+.chunks/
+*.part
+proxy_log.txt
+
+# Never commit media (sources or proxies)
+*.mov
+*.mp4
+*.mxf
+*.mkv
+*.avi
+*.m4v
+*.mts
+*.m2ts
+
+# Local scratch / test folders
+_bench*/
+_fbtest/
+_crashtest/
+_apptest/
+_sizetest/
+_chunktest/
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
