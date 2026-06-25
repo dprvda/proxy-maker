@@ -53,8 +53,8 @@ Proxies land in a `proxies` subfolder next to your videos. Close and re‑run an
 
 | Option | What it does |
 |---|---|
-| **Quality** | Proxy height in pixels (360 / 540 / 720). Lower = smaller files and lighter playback. |
-| **Codec** | **ProRes Proxy** (default, works everywhere) or **DNxHR LB** (smaller; auto‑falls back to ProRes on rare problem frames). |
+| **Quality** | Proxy height in pixels (360 / 540 / 720), lower = smaller and lighter playback — or **Original** to keep the full source resolution (a full‑quality transcode, not a small proxy). |
+| **Codec** | **ProRes Proxy** (default, works everywhere), **ProRes 422 LT** (higher quality, larger), or **DNxHR LB** (smaller; auto‑falls back to ProRes on rare problem frames). The codec is part of the output filename, so different codecs/qualities never overwrite each other. |
 | **At once** | How many files to convert in parallel. |
 | **Frame rate** | *Keep original* (required for Premiere). 30/15 are lighter to play in After Effects but will **not** attach as Premiere proxies. |
 | **GPU decode** | Optional; can speed up decoding on some machines. |

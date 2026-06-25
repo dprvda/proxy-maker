@@ -45,16 +45,20 @@ again later to continue.
 ------------------------------------------------------------
 THE OPTIONS (sensible defaults are already set)
 ------------------------------------------------------------
-  Quality       360 / 540 / 720  — the proxy's height in pixels.
+  Quality       360 / 540 / 720 / Original  — the proxy's height in pixels.
                 Lower = smaller files + lighter playback. 540 is a
                 good default. (To play smoother, lower THIS — not
-                the frame rate.)
+                the frame rate.)  Original = keep the full source
+                resolution — a full-quality transcode, not a small proxy.
 
   Codec         ProRes Proxy = recommended default; works on all files.
+                ProRes 422 LT = higher quality than Proxy, larger files.
                 DNxHR LB = a bit smaller + faster, but can fail on rare complex
                 frames. If it does, THAT file is redone automatically in ProRes
                 Proxy so the run still finishes (the folder may then hold a mix
                 of both, which is perfectly fine).
+                (The codec is part of the output filename, so different
+                codecs/qualities never overwrite each other.)
 
   At once       How many files to convert simultaneously. 2-3 is
                 usually best on a laptop.
@@ -114,7 +118,8 @@ GOOD TO KNOW
   - While converting, temporary chunks live in  proxies\.chunks\  and are
     deleted automatically as each file finishes. A file briefly needs about
     2x its final size on disk during the final stitch step.
-  - Output files are named  <name>_proxy_540p.mov
+  - Output files are named  <name>_proxy_<quality>_<codec>[_<fps>fps].mov
+    e.g.  CAM A_proxy_540p_prores.mov  or  CAM A_proxy_full_lt_30fps.mov
   - Incomplete downloads (".part" files) are ignored automatically.
   - A log of any failures is written to  proxies\proxy_log.txt
   - To re-make proxies at a different quality, just change Quality

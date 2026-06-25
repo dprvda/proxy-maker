@@ -37,11 +37,19 @@ COPY_OK_AUDIO = {"aac", "ac3", "eac3", "alac", "mp3",
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 PRORES_ARGS = ["-c:v", "prores_ks", "-profile:v", "0", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
+PRORES_LT_ARGS = ["-c:v", "prores_ks", "-profile:v", "1", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
 CODECS = {
     "ProRes Proxy (recommended)":        PRORES_ARGS,
+    "ProRes 422 LT (higher quality)":    PRORES_LT_ARGS,
     "DNxHR LB (smaller; auto-fallback)": ["-c:v", "dnxhd", "-profile:v", "dnxhr_lb", "-pix_fmt", "yuv422p"],
 }
-HEIGHTS = ["360", "540", "720"]
+# short tag added to the output filename so different codecs/profiles don't collide
+CODEC_TAGS = {
+    "ProRes Proxy (recommended)":        "prores",
+    "ProRes 422 LT (higher quality)":    "lt",
+    "DNxHR LB (smaller; auto-fallback)": "dnxhr",
+}
+HEIGHTS = ["360", "540", "720", "Original"]   # "Original" = keep full source resolution
 CHUNK_SECS = 120   # each ~2-minute chunk is an atomic checkpoint (a crash loses <= 1 chunk)
 
 
@@ -168,15 +176,17 @@ class App:
         ttk.Label(opt, text="Quality:").pack(side="left")
         self.height_var = tk.StringVar(value="540")
         hcb = ttk.Combobox(opt, textvariable=self.height_var, values=HEIGHTS,
-                           width=6, state="readonly")
+                           width=9, state="readonly")
         hcb.pack(side="left", padx=(4, 12))
         hcb.bind("<<ComboboxSelected>>", lambda e: self.refresh_list())
-        ttk.Label(opt, text="(lower = lighter playback)").pack(side="left")
+        ttk.Label(opt, text="(lower = lighter; Original = full res)").pack(side="left")
 
         ttk.Label(opt, text="   Codec:").pack(side="left")
         self.codec_var = tk.StringVar(value=list(CODECS)[0])
-        ttk.Combobox(opt, textvariable=self.codec_var, values=list(CODECS),
-                     width=30, state="readonly").pack(side="left", padx=4)
+        ccb = ttk.Combobox(opt, textvariable=self.codec_var, values=list(CODECS),
+                           width=30, state="readonly")
+        ccb.pack(side="left", padx=4)
+        ccb.bind("<<ComboboxSelected>>", lambda e: self.refresh_list())
 
         ttk.Label(opt, text="   At once:").pack(side="left")
         default_par = max(1, min(3, (os.cpu_count() or 4) // 2))
@@ -259,10 +269,13 @@ class App:
         os.makedirs(d, exist_ok=True)
         return d
 
-    def out_path_for(self, path, height, fps=None):
+    def out_path_for(self, path, height, fps=None, codec=None):
         base = os.path.splitext(os.path.basename(path))[0]
-        tag = f"_{fps}fps" if fps else ""
-        return os.path.join(self.outdir(), f"{base}_proxy_{height}p{tag}.mov")
+        res = "full" if height == "Original" else f"{height}p"
+        ctag = CODEC_TAGS.get(codec, "")
+        ctag = f"_{ctag}" if ctag else ""
+        ftag = f"_{fps}fps" if fps else ""
+        return os.path.join(self.outdir(), f"{base}_proxy_{res}{ctag}{ftag}.mov")
 
     def _fps_from_var(self):
         v = self.fps_var.get()
@@ -326,12 +339,13 @@ class App:
         self.items.clear()
         height = self.height_var.get()
         fps = self._fps_from_var()
+        codec = self.codec_var.get()
         for path in self.scan_files():
             try:
                 size = os.path.getsize(path)
             except Exception:
                 size = 0
-            out = self.out_path_for(path, height, fps)
+            out = self.out_path_for(path, height, fps, codec)
             status = "done" if os.path.exists(out) else "pending"
             it = {"path": path, "name": os.path.basename(path), "size": size,
                   "dur": 0.0, "out": out, "audio": "copy",
@@ -418,8 +432,9 @@ class App:
         L.append("so they play smoothly while editing in Adobe Premiere Pro / After Effects.")
         L.append("")
         L.append("HOW IT WORKS (so you can understand any error):")
-        L.append("- For each video it runs ffmpeg to shrink the picture and re-encode it as")
-        L.append("  ProRes Proxy (default) or DNxHR LB, inside a .mov file.")
+        L.append("- For each video it runs ffmpeg to (optionally) shrink the picture and re-encode")
+        L.append("  it as ProRes Proxy (default), ProRes 422 LT, or DNxHR LB, inside a .mov file.")
+        L.append("  With the 'Original' quality it keeps the full source resolution (full-res transcode).")
         L.append("- The AUDIO is COPIED from the original unchanged and the frame rate is kept")
         L.append("  the same; both MUST match the original or Premiere won't attach the proxy.")
         L.append("- Crash-safe with CHECKPOINTS: each file is encoded in ~2-minute chunks saved")
@@ -434,8 +449,8 @@ class App:
         L.append("THE ffmpeg COMMAND IT RUNS PER FILE (template):")
         L.append("  ffmpeg -hide_banner -loglevel error -nostats -progress pipe:1 [-hwaccel auto]")
         L.append('    -i "INPUT" -map 0:v:0 -map 0:a:0?')
-        L.append("    -vf scale=-2:HEIGHT:flags=bilinear[,fps=N]")
-        L.append("    -c:v prores_ks -profile:v 0 -pix_fmt yuv422p10le   (or DNxHR: -c:v dnxhd -profile:v dnxhr_lb)")
+        L.append("    [-vf scale=-2:HEIGHT:flags=bilinear[,fps=N]]   (no scale when quality = Original)")
+        L.append("    -c:v prores_ks -profile:v 0 -pix_fmt yuv422p10le   (Proxy=0, 422 LT=1; or DNxHR: -c:v dnxhd -profile:v dnxhr_lb)")
         L.append('    -c:a copy  (or: -c:a aac -b:a 192k)  -f mov -y "OUTPUT.mov.part"')
         L.append("")
         L.append("MY COMPUTER:")
@@ -482,12 +497,13 @@ class App:
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         height = self.height_var.get()
-        vargs = CODECS[self.codec_var.get()]
+        codec = self.codec_var.get()
+        vargs = CODECS[codec]
         fps = self._fps_from_var()
         hw = bool(self.hwaccel.get())
-        self.log(f"START folder={self.folder} height={height} codec={self.codec_var.get()} "
+        self.log(f"START folder={self.folder} height={height} codec={codec} "
                  f"parallel={self.parallel.get()} fps={fps} gpu={hw}")
-        threading.Thread(target=self.controller, args=(height, vargs, fps, hw), daemon=True).start()
+        threading.Thread(target=self.controller, args=(height, vargs, fps, hw, codec), daemon=True).start()
 
     def on_stop(self):
         if not self.running:
@@ -501,7 +517,7 @@ class App:
                 except Exception:
                     pass
 
-    def controller(self, height, vargs, fps, hwaccel):
+    def controller(self, height, vargs, fps, hwaccel, codec):
         pending = []
         for iid, it in list(self.items.items()):
             if self.cancel.is_set():
@@ -509,7 +525,7 @@ class App:
             with self.lock:
                 it["status"] = "checking…"
             dur, has_video, acodec, ach = run_ffprobe(it["path"])
-            out = self.out_path_for(it["path"], height, fps)
+            out = self.out_path_for(it["path"], height, fps, codec)
             if acodec is None:
                 audio = "none"
             elif acodec in COPY_OK_AUDIO:
@@ -576,9 +592,12 @@ class App:
         else:
             amap, aargs = ["-map", "1:a:0?"], ["-c:a", "aac", "-b:a", "192k"]
 
-        vf = f"scale=-2:{height}:flags=bilinear"
+        filters = []
+        if height != "Original":
+            filters.append(f"scale=-2:{height}:flags=bilinear")
         if fps:
-            vf += f",fps={fps}"
+            filters.append(f"fps={fps}")
+        vf_args = ["-vf", ",".join(filters)] if filters else []
         pre = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
         if hwaccel:
             pre += ["-hwaccel", "auto"]
@@ -619,9 +638,9 @@ class App:
                 self._safe_remove(cpart)
                 if dur > 0:
                     ccmd = (pre + ["-ss", f"{start:.3f}", "-i", it["path"], "-t", f"{length:.3f}",
-                            "-map", "0:v:0", "-vf", vf] + codec_args + ["-an", "-f", "mov", "-y", cpart])
+                            "-map", "0:v:0"] + vf_args + codec_args + ["-an", "-f", "mov", "-y", cpart])
                 else:
-                    ccmd = (pre + ["-i", it["path"], "-map", "0:v:0", "-vf", vf]
+                    ccmd = (pre + ["-i", it["path"], "-map", "0:v:0"] + vf_args
                             + codec_args + ["-an", "-f", "mov", "-y", cpart])
                 rc, err_tail = self._run_ffmpeg(iid, it, ccmd, base=start, total=dur)
                 if self.cancel.is_set():
