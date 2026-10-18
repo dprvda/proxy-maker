@@ -117,6 +117,7 @@ const CODECS: { value: Codec; label: string; description: string }[] = [
   { value: 'prores', label: 'ProRes Proxy', description: 'Recommended. Works in every editor.' },
   { value: 'lt', label: 'ProRes 422 LT', description: 'Higher quality, larger files.' },
   { value: 'dnxhr', label: 'DNxHR LB', description: 'Smallest. Falls back to ProRes on rare problem frames.' },
+  { value: 'h264', label: 'H.264', description: 'About 20× smaller, plays on phones and the web. Encoded on the GPU when GPU is on.' },
 ]
 
 const FPS: { value: Fps; label: string }[] = [
@@ -410,7 +411,7 @@ function Screen() {
               options={QUALITY.map((o) => ({ ...o, disabled: locked }))}
               value={draft?.height ?? '540'}
               onValueChange={(v) => change('height', v as Height)}
-              description="Proxy height. Lower plays lighter; Original keeps full resolution."
+              description="Short side of the picture: 540p is 960×540, or 540×960 for phone video. Lower plays lighter; Original keeps full resolution."
             />
             <RadioGroup
               label="Codec"
@@ -444,8 +445,8 @@ function Screen() {
               onValueChange={(v) => v != null && change('parallel', v, 300)}
             />
             <Checkbox
-              label="GPU decode"
-              description="Can speed up reading the originals on some computers."
+              label="Use GPU"
+              description="Reads the originals on the GPU; H.264 is also encoded there (NVIDIA)."
               checked={draft?.hwaccel ?? false}
               disabled={locked}
               onCheckedChange={(v: boolean | 'indeterminate') => change('hwaccel', v === true)}

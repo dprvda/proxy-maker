@@ -1,7 +1,7 @@
 // The page talks to make_proxies.py on the same origin (or through Vite's /api proxy in dev).
 
 export type Height = '360' | '540' | '720' | 'Original'
-export type Codec = 'prores' | 'lt' | 'dnxhr'
+export type Codec = 'prores' | 'lt' | 'dnxhr' | 'h264'
 export type Fps = 'keep' | '30' | '15'
 
 export interface Settings {

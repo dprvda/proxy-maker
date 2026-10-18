@@ -53,11 +53,24 @@ Proxies land in a `proxies` subfolder next to your videos. Close and re‑run an
 
 | Option | What it does |
 |---|---|
-| **Quality** | Proxy height in pixels (360 / 540 / 720), lower = smaller and lighter playback — or **Original** to keep the full source resolution (a full‑quality transcode, not a small proxy). |
-| **Codec** | **ProRes Proxy** (default, works everywhere), **ProRes 422 LT** (higher quality, larger), or **DNxHR LB** (smaller; auto‑falls back to ProRes on rare problem frames). The codec is part of the output filename, so different codecs/qualities never overwrite each other. |
+| **Quality** | The proxy's short side in pixels (360 / 540 / 720): 540 gives 960×540 for landscape and 540×960 for vertical phone video. Lower = smaller and lighter playback — or **Original** to keep the full source resolution (a full‑quality transcode, not a small proxy). |
+| **Codec** | **ProRes Proxy** (default, works everywhere), **ProRes 422 LT** (higher quality, larger), **DNxHR LB** (smaller; auto‑falls back to ProRes on rare problem frames), or **H.264** (short GOP, about 20× smaller, plays on phones and in browsers; written as `.mp4`). The codec is part of the output filename, so different codecs/qualities never overwrite each other. |
 | **At once** | How many files to convert in parallel. |
 | **Frame rate** | *Keep original* (required for Premiere). 30/15 are lighter to play in After Effects but will **not** attach as Premiere proxies. |
-| **GPU decode** | Optional; can speed up decoding on some machines. |
+| **Use GPU** | Optional. Reads the originals on the GPU; with **H.264** the proxy is also encoded on an NVIDIA GPU (NVENC), and a file falls back to the CPU encoder automatically if that fails. ProRes and DNxHR have no GPU encoder. |
+
+## Command line (no page)
+
+For scripts and servers, pass files or folders and it runs without the page. Progress goes to stderr, a JSON
+summary of every file to stdout, and the exit code is 1 if any file failed.
+
+```
+python3 make_proxies.py clip1.MOV clip2.MOV --quality 540 --codec h264 --gpu --out /path/to/proxies
+python3 make_proxies.py /path/to/shoot --recurse --codec prores
+```
+
+Options: `--quality 360|540|720|Original`, `--codec prores|lt|dnxhr|h264`, `--fps keep|30|15`, `--parallel N`,
+`--gpu`, `--recurse`, `--out DIR` (default: a `proxies` folder next to the videos).
 
 ## How it works (for the curious)
 

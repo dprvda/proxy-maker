@@ -41,6 +41,7 @@ WEBUI = os.path.join(HERE, "dist")
 VIDEO_EXTS = {".mp4", ".mov", ".mxf", ".mkv", ".avi", ".m4v", ".mts", ".m2ts", ".ts"}
 COPY_OK_AUDIO = {"aac", "ac3", "eac3", "alac", "mp3",
                  "pcm_s16le", "pcm_s24le", "pcm_s16be", "pcm_s24be"}
+COPY_OK_AUDIO_MP4 = {"aac", "ac3", "eac3", "alac", "mp3"}   # .mp4 cannot hold PCM
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
@@ -52,7 +53,18 @@ CODECS = {
     "lt":     ("ProRes 422 LT (higher quality)", PRORES_LT_ARGS),
     "dnxhr":  ("DNxHR LB (smaller; auto-fallback)",
                ["-c:v", "dnxhd", "-profile:v", "dnxhr_lb", "-pix_fmt", "yuv422p"]),
+    # short GOP (a keyframe every 15 frames, no B-frames): ~20x smaller than ProRes, still scrubs
+    # well on any modern GPU, and plays in phone browsers. Written as .mp4.
+    "h264":   ("H.264 short GOP (small; phones and web)",
+               ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "15", "-keyint_min", "15",
+                "-bf", "0", "-sc_threshold", "0", "-pix_fmt", "yuv420p"]),
 }
+MP4_CODECS = {"h264"}
+# With "GPU" on, H.264 is encoded on an NVIDIA card (NVENC); any failure falls back to the CPU encoder.
+# ProRes and DNxHR have no GPU encoder, so for them "GPU" only speeds up decoding.
+H264_NVENC_ARGS = ["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0",
+                   "-g", "15", "-bf", "0", "-pix_fmt", "yuv420p"]
+# Quality is the SHORT side of the picture: 540 gives 960x540 for landscape and 540x960 for phone video.
 HEIGHTS = ["360", "540", "720", "Original"]   # "Original" = keep full source resolution
 FPS_CHOICES = ["keep", "30", "15"]
 CHUNK_SECS = int(os.environ.get("PROXY_MAKER_CHUNK_SECS", "120"))   # each chunk is an atomic checkpoint
@@ -172,10 +184,12 @@ class Engine:
         self.finished_at = None  # wall-clock of the last run's end (UI shows a toast)
         self.tools = tools_ok()
         self._ffver = None
+        self.files = None        # explicit file list (command line); None = scan the folder
+        self.out_override = None # explicit output folder (command line); None = <folder>/proxies
 
     # ---------- helpers ----------
     def outdir(self):
-        d = os.path.join(self.folder, "proxies")
+        d = self.out_override or os.path.join(self.folder, "proxies")
         os.makedirs(d, exist_ok=True)
         return d
 
@@ -184,7 +198,8 @@ class Engine:
         res = "full" if height == "Original" else f"{height}p"
         ctag = f"_{codec}" if codec in CODECS else ""
         ftag = f"_{fps}fps" if fps else ""
-        return os.path.join(self.folder, "proxies", f"{base}_proxy_{res}{ctag}{ftag}.mov")
+        ext = ".mp4" if codec in MP4_CODECS else ".mov"
+        return os.path.join(self.outdir(), f"{base}_proxy_{res}{ctag}{ftag}{ext}")
 
     def _fps(self):
         v = self.settings["fps"]
@@ -213,6 +228,8 @@ class Engine:
         return "\n".join(time.strftime("%H:%M:%S ", time.localtime(t)) + m for t, m in lines)
 
     def scan_files(self):
+        if self.files is not None:
+            return list(self.files)
         folder = self.folder
         found = []
         if self.settings["recurse"]:
@@ -303,7 +320,7 @@ class Engine:
             self.job_start = None
             self.run_iids = set()
         height, codec, fps, hw = s["height"], s["codec"], self._fps(), s["hwaccel"]
-        vargs = CODECS[codec][1]
+        vargs = H264_NVENC_ARGS if (codec == "h264" and hw) else CODECS[codec][1]
         self.message = "Checking files…"
         self.log(f"START folder={self.folder} height={height} codec={CODECS[codec][0]} "
                  f"parallel={s['parallel']} fps={fps} gpu={hw}")
@@ -332,9 +349,10 @@ class Engine:
                 it["status"] = "checking…"
             dur, has_video, acodec, ach = run_ffprobe(it["path"])
             out = self.out_path_for(it["path"], height, fps, codec)
+            copy_ok = COPY_OK_AUDIO_MP4 if codec in MP4_CODECS else COPY_OK_AUDIO
             if acodec is None:
                 audio = "none"
-            elif acodec in COPY_OK_AUDIO:
+            elif acodec in copy_ok:
                 audio = "copy"
             else:
                 audio = "aac"
@@ -406,10 +424,12 @@ class Engine:
 
         filters = []
         if height != "Original":
-            filters.append(f"scale=-2:{height}:flags=bilinear")
+            # the SHORT side becomes `height`, so phone video (portrait) gets 540x960, not 304x540
+            filters.append(f"scale='if(gte(iw,ih),-2,{height})':'if(gte(iw,ih),{height},-2)':flags=bilinear")
         if fps:
             filters.append(f"fps={fps}")
         vf_args = ["-vf", ",".join(filters)] if filters else []
+        mp4 = self.settings["codec"] in MP4_CODECS
         pre = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
         if hwaccel:
             pre += ["-hwaccel", "auto"]
@@ -432,7 +452,7 @@ class Engine:
 
         # ---- encode each chunk; an existing chunk file means "already done" (resume) ----
         chunk_files = []
-        while True:                       # may restart once if DNxHR must fall back to ProRes
+        while True:                       # may restart once if DNxHR -> ProRes or GPU -> CPU
             chunk_files = []
             restart = False
             for i in range(n_chunks):
@@ -468,6 +488,16 @@ class Engine:
                 else:
                     self._safe_remove(cpart)
                     # DNxHR encoder bug on a chunk -> switch this whole file to ProRes and restart
+                    if codec_args is vargs and "h264_nvenc" in vargs:
+                        self.log(f"{it['name']}: GPU encoder failed - switching this file to the CPU encoder")
+                        codec_args, codec_label = CODECS["h264"][1], "H.264 on CPU"
+                        for cf in chunk_files:
+                            self._safe_remove(cf)
+                        with self.lock:
+                            it["status"] = "encoding (H.264 on CPU)"
+                            it["pct"] = 0
+                        restart = True
+                        break
                     if codec_args is vargs and any(a == "dnxhd" for a in vargs):
                         self.log(f"{it['name']}: DNxHR failed on a chunk - switching this file to ProRes Proxy")
                         codec_args, codec_label = PRORES_ARGS, "ProRes Proxy"
@@ -510,9 +540,10 @@ class Engine:
             return
 
         self._safe_remove(part)
+        fmt = ["-f", "mp4", "-movflags", "+faststart"] if mp4 else ["-f", "mov"]
         ccat = (["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1",
                  "-f", "concat", "-safe", "0", "-i", listpath, "-i", it["path"],
-                 "-map", "0:v:0"] + amap + ["-c:v", "copy"] + aargs + ["-f", "mov", "-y", part])
+                 "-map", "0:v:0"] + amap + ["-c:v", "copy"] + aargs + fmt + ["-y", part])
         rc, err_tail = self._run_ffmpeg(iid, it, ccat, base=0, total=dur)
         if self.cancel.is_set():
             self._safe_remove(part)
@@ -727,7 +758,10 @@ class Engine:
         L.append("- START.bat runs 'python make_proxies.py', which starts a small local web server")
         L.append(f"  on http://{HOST}:{PORT} and opens the page in the browser.")
         L.append("- For each video it runs ffmpeg to (optionally) shrink the picture and re-encode")
-        L.append("  it as ProRes Proxy (default), ProRes 422 LT, or DNxHR LB, inside a .mov file.")
+        L.append("  it as ProRes Proxy (default), ProRes 422 LT, or DNxHR LB, inside a .mov file,")
+        L.append("  or as short-GOP H.264 inside an .mp4 (small; with GPU on, encoded by NVIDIA NVENC,")
+        L.append("  falling back to the CPU encoder libx264 if NVENC fails).")
+        L.append("  Quality is the SHORT side: 540 gives 960x540 for landscape and 540x960 for phone video.")
         L.append("  With the 'Original' quality it keeps the full source resolution (full-res transcode).")
         L.append("- The AUDIO is COPIED from the original unchanged and the frame rate is kept")
         L.append("  the same; both MUST match the original or Premiere won't attach the proxy.")
@@ -743,8 +777,9 @@ class Engine:
         L.append("THE ffmpeg COMMAND IT RUNS PER FILE (template):")
         L.append("  ffmpeg -hide_banner -loglevel error -nostats -progress pipe:1 [-hwaccel auto]")
         L.append('    -i "INPUT" -map 0:v:0 -map 0:a:0?')
-        L.append("    [-vf scale=-2:HEIGHT:flags=bilinear[,fps=N]]   (no scale when quality = Original)")
-        L.append("    -c:v prores_ks -profile:v 0 -pix_fmt yuv422p10le   (Proxy=0, 422 LT=1; or DNxHR: -c:v dnxhd -profile:v dnxhr_lb)")
+        L.append("    [-vf scale='if(gte(iw,ih),-2,Q)':'if(gte(iw,ih),Q,-2)':flags=bilinear[,fps=N]]   (no scale when quality = Original)")
+        L.append("    -c:v prores_ks -profile:v 0 -pix_fmt yuv422p10le   (Proxy=0, 422 LT=1; or DNxHR: -c:v dnxhd -profile:v dnxhr_lb;")
+        L.append("     or H.264: -c:v libx264 -crf 23 -g 15 -bf 0 / -c:v h264_nvenc -cq 23 -g 15 -bf 0)")
         L.append('    -c:a copy  (or: -c:a aac -b:a 192k)  -f mov -y "OUTPUT.mov.part"')
         L.append("")
         L.append("MY COMPUTER:")
@@ -754,7 +789,7 @@ class Engine:
         L.append("")
         L.append("SETTINGS I USED THIS TIME:")
         L.append(f"  folder = {s['folder']}")
-        L.append(f"  quality(height) = {s['height']}    codec = {CODECS[s['codec']][0]}")
+        L.append(f"  quality(short side) = {s['height']}    codec = {CODECS[s['codec']][0]}")
         L.append(f"  convert at once = {s['parallel']}    frame rate = "
                  f"{'Keep original' if s['fps'] == 'keep' else s['fps']}")
         L.append(f"  GPU decode = {s['hwaccel']}    include subfolders = {s['recurse']}")
@@ -890,8 +925,75 @@ def already_running(url):
         return False
 
 
+def cli(argv):
+    """Command line: make proxies without the page, e.g. from a server or a script.
+    Progress goes to stderr; a JSON summary goes to stdout. Exit code 1 if any file failed."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="make_proxies.py",
+                                 description="Make proxies without the browser page.")
+    ap.add_argument("paths", nargs="+", help="video files and/or folders")
+    ap.add_argument("--quality", choices=HEIGHTS, default="540",
+                    help="short side of the picture in pixels (540 = 960x540, or 540x960 for phone video)")
+    ap.add_argument("--codec", choices=list(CODECS), default="prores")
+    ap.add_argument("--fps", choices=FPS_CHOICES, default="keep")
+    ap.add_argument("--parallel", type=int, default=default_settings()["parallel"])
+    ap.add_argument("--gpu", action="store_true", help="GPU decoding; H.264 is also encoded on the GPU")
+    ap.add_argument("--recurse", action="store_true", help="include subfolders of folder arguments")
+    ap.add_argument("--out", help="output folder (default: a 'proxies' folder next to the videos)")
+    a = ap.parse_args(argv)
+
+    files = []
+    for pth in a.paths:
+        pth = os.path.abspath(os.path.expanduser(pth))
+        if os.path.isdir(pth):
+            for root, dirs, names in os.walk(pth):
+                dirs[:] = [d for d in dirs if d.lower() != "proxies"] if a.recurse else []
+                for fn in sorted(names):
+                    Engine._maybe_add(root, fn, files)
+        elif os.path.isfile(pth):
+            files.append(pth)
+        else:
+            print(f"not found: {pth}", file=sys.stderr)
+            return 2
+    if not files:
+        print("no video files found", file=sys.stderr)
+        return 2
+    if not tools_ok():
+        print("ffmpeg / ffprobe were not found on PATH", file=sys.stderr)
+        return 2
+
+    e = Engine()
+    e.files = files
+    e.out_override = os.path.abspath(os.path.expanduser(a.out)) if a.out else None
+    folder = os.path.commonpath([os.path.dirname(f) for f in files])
+    t0 = time.time()
+    err = e.start({"folder": folder, "height": a.quality, "codec": a.codec, "fps": a.fps,
+                   "parallel": a.parallel, "hwaccel": a.gpu})
+    if err:
+        print(err, file=sys.stderr)
+        return 2
+    shown = 0
+    while True:
+        running = e.running
+        with e.lock:
+            lines = e.loglines[shown:]
+        for t, m in lines:
+            print(time.strftime("%H:%M:%S ", time.localtime(t)) + m, file=sys.stderr, flush=True)
+        shown += len(lines)
+        if not running:
+            break
+        time.sleep(0.25)
+    with e.lock:
+        result = [{"source": it["path"], "proxy": it["out"], "status": it["status"], "error": it.get("err", "")}
+                  for it in e.items.values()]
+    print(json.dumps({"seconds": round(time.time() - t0, 2), "files": result}, indent=1, ensure_ascii=False))
+    return 1 if any(r["status"] == "FAILED" for r in result) else 0
+
+
 def main():
     global ENGINE
+    if len(sys.argv) > 1:
+        sys.exit(cli(sys.argv[1:]))
     url = f"http://{HOST}:{PORT}/"
     if already_running(url):
         print(f"Proxy Maker is already running — opening {url}")
