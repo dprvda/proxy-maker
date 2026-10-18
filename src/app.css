@@ -1,0 +1,67 @@
+/* Layout only: colours, type and radii come from the Beamline look (tokens and type roles). */
+body {
+  margin: 0;
+}
+
+.page {
+  box-sizing: border-box;
+  max-width: 1480px;
+  margin-inline: auto;
+  padding: var(--pui-space-8) var(--pui-gutter-page) var(--pui-space-16);
+  display: grid;
+  gap: var(--pui-space-6);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 400px) minmax(0, 1fr);
+  gap: var(--pui-space-6);
+  align-items: start;
+}
+
+.settings {
+  position: sticky;
+  top: var(--pui-space-6);
+}
+
+.main {
+  display: grid;
+  gap: var(--pui-space-6);
+  min-width: 0;
+}
+
+.stack {
+  display: grid;
+  gap: var(--pui-space-5);
+  min-width: 0;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--pui-space-4);
+}
+
+.row-progress {
+  width: 100%;
+}
+
+.detail {
+  display: block;
+  color: var(--pui-ink-2);
+}
+
+@media (max-width: 1080px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings {
+    position: static;
+  }
+}
+
+@media (max-width: 720px) {
+  .metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}

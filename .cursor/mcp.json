@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "beamline": {
+      "url": "https://mcp.beamline.io/mcp"
+    }
+  }
+}

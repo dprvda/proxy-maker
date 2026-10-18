@@ -3,32 +3,40 @@
 """
 Proxy Maker — crash-safe Premiere Pro proxy generator.
 
-- Converts heavy videos to small, fast-scrubbing proxies (DNxHR LB by default).
+- Converts heavy videos to small, fast-scrubbing proxies (ProRes Proxy by default).
 - Audio is COPIED from the source untouched (identical channels/rate/duration)
   so Premiere will attach the proxy. Re-encodes only if the source audio codec
   cannot be copied into .mov.
 - Frame rate is preserved (required for proxy attach).
-- Crash-safe: each file is encoded to a ".part" file and only renamed to its
-  final name when fully finished and verified. Finished proxies are permanent
-  restore points -- just run again to continue where it stopped.
+- Crash-safe: each file is encoded in ~2-minute chunks (checkpoints) and the
+  final file is only renamed into place when fully finished and verified.
+  Just run again to continue where it stopped.
 - Parallel: converts several files at once.
-- Simple 1-window UI for non-technical users.
+- Simple one-screen UI in the browser, served by this script on 127.0.0.1.
 
-Needs: Python 3.8+ (tkinter, included) and ffmpeg + ffprobe on PATH.
+Needs: Python 3.8+ (standard library only) and ffmpeg + ffprobe on PATH.
+The UI is prebuilt into ./dist (source in ./src, see CONTRIBUTING.md).
 """
 
 import os
 import sys
 import json
 import time
+import platform
 import threading
 import subprocess
+import webbrowser
+import mimetypes
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 APP_TITLE = "Proxy Maker  —  crash-safe Premiere proxies"
+HOST = "127.0.0.1"
+PORT = int(os.environ.get("PROXY_MAKER_PORT", "8765"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+WEBUI = os.path.join(HERE, "dist")
 
 VIDEO_EXTS = {".mp4", ".mov", ".mxf", ".mkv", ".avi", ".m4v", ".mts", ".m2ts", ".ts"}
 COPY_OK_AUDIO = {"aac", "ac3", "eac3", "alac", "mp3",
@@ -38,19 +46,16 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 PRORES_ARGS = ["-c:v", "prores_ks", "-profile:v", "0", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
 PRORES_LT_ARGS = ["-c:v", "prores_ks", "-profile:v", "1", "-vendor", "apl0", "-pix_fmt", "yuv422p10le"]
+# codec id (also the short tag in the output filename, so codecs never collide) -> (label, ffmpeg args)
 CODECS = {
-    "ProRes Proxy (recommended)":        PRORES_ARGS,
-    "ProRes 422 LT (higher quality)":    PRORES_LT_ARGS,
-    "DNxHR LB (smaller; auto-fallback)": ["-c:v", "dnxhd", "-profile:v", "dnxhr_lb", "-pix_fmt", "yuv422p"],
-}
-# short tag added to the output filename so different codecs/profiles don't collide
-CODEC_TAGS = {
-    "ProRes Proxy (recommended)":        "prores",
-    "ProRes 422 LT (higher quality)":    "lt",
-    "DNxHR LB (smaller; auto-fallback)": "dnxhr",
+    "prores": ("ProRes Proxy (recommended)", PRORES_ARGS),
+    "lt":     ("ProRes 422 LT (higher quality)", PRORES_LT_ARGS),
+    "dnxhr":  ("DNxHR LB (smaller; auto-fallback)",
+               ["-c:v", "dnxhd", "-profile:v", "dnxhr_lb", "-pix_fmt", "yuv422p"]),
 }
 HEIGHTS = ["360", "540", "720", "Original"]   # "Original" = keep full source resolution
-CHUNK_SECS = 120   # each ~2-minute chunk is an atomic checkpoint (a crash loses <= 1 chunk)
+FPS_CHOICES = ["keep", "30", "15"]
+CHUNK_SECS = int(os.environ.get("PROXY_MAKER_CHUNK_SECS", "120"))   # each chunk is an atomic checkpoint
 
 
 def human(n):
@@ -112,156 +117,61 @@ def tools_ok():
     return True
 
 
-class App:
-    def __init__(self, root):
-        self.root = root
+def default_settings():
+    return {
+        "folder": HERE,
+        "height": "540",
+        "codec": "prores",
+        "fps": "keep",
+        "parallel": max(1, min(3, (os.cpu_count() or 4) // 2)),
+        "recurse": False,
+        "hwaccel": False,
+    }
+
+
+def clean_settings(raw, base):
+    """Merge user-sent settings into base, keeping only valid values."""
+    s = dict(base)
+    raw = raw or {}
+    if isinstance(raw.get("folder"), str) and raw["folder"].strip():
+        s["folder"] = os.path.expanduser(raw["folder"].strip())
+    if raw.get("height") in HEIGHTS:
+        s["height"] = raw["height"]
+    if raw.get("codec") in CODECS:
+        s["codec"] = raw["codec"]
+    if str(raw.get("fps")) in FPS_CHOICES:
+        s["fps"] = str(raw["fps"])
+    try:
+        s["parallel"] = max(1, min(8, int(raw.get("parallel", s["parallel"]))))
+    except Exception:
+        pass
+    for k in ("recurse", "hwaccel"):
+        if k in raw:
+            s[k] = bool(raw[k])
+    return s
+
+
+class Engine:
+    """Everything the old Tkinter window did, without the window: scan, convert, report."""
+
+    def __init__(self):
         self.lock = threading.Lock()
         self.items = {}          # iid (full path) -> state dict
         self.procs = {}          # iid -> Popen
         self.cancel = threading.Event()
         self.running = False
         self.logfile = None
-        self.loglines = []       # full in-memory log (for the box + copy buttons)
-        self._log_index = 0      # how many lines already drawn into the log box
+        self.logfile_dir = None
+        self.loglines = []       # [(epoch, text)] full in-memory log
         self.job_start = None    # wall-clock when the current run began (for ETA)
         self.run_iids = set()    # files being processed in the current run (for ETA)
-        self.last_ckpt = None    # wall-clock of the last finished file (restore point)
-        self.folder = os.path.dirname(os.path.abspath(__file__))
-
-        self._build_ui()
-
-        if not tools_ok():
-            messagebox.showerror(
-                APP_TITLE,
-                "ffmpeg / ffprobe were not found on this PC.\n\n"
-                "Install them, then reopen this program:\n\n"
-                "    winget install --id Gyan.FFmpeg -e\n\n"
-                "(then close and reopen PowerShell once)")
-        self.refresh_list()
-        self._tick()
-
-    # ---------- UI ----------
-    def _build_ui(self):
-        self.root.title(APP_TITLE)
-        self.root.geometry("900x650")
-        self.root.minsize(780, 540)
-
-        style = ttk.Style()
-        try:
-            style.theme_use("vista")
-        except Exception:
-            pass
-        style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
-        style.configure("Treeview", rowheight=24)
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
-
-        header = ttk.Frame(self.root)
-        header.pack(fill="x", padx=12, pady=(10, 2))
-        ttk.Label(header, text="Proxy Maker",
-                  font=("Segoe UI", 16, "bold")).pack(side="left")
-        ttk.Label(header, text="   light, smooth-playing copies for Premiere / After Effects",
-                  foreground="#666666").pack(side="left", pady=(7, 0))
-
-        pad = dict(padx=12, pady=4)
-
-        top = ttk.Frame(self.root)
-        top.pack(fill="x", **pad)
-        ttk.Label(top, text="Video folder:").pack(side="left")
-        self.folder_var = tk.StringVar(value=self.folder)
-        ttk.Entry(top, textvariable=self.folder_var).pack(side="left", fill="x", expand=True, padx=6)
-        ttk.Button(top, text="Browse…", command=self.on_browse).pack(side="left")
-
-        opt = ttk.Frame(self.root)
-        opt.pack(fill="x", **pad)
-        ttk.Label(opt, text="Quality:").pack(side="left")
-        self.height_var = tk.StringVar(value="540")
-        hcb = ttk.Combobox(opt, textvariable=self.height_var, values=HEIGHTS,
-                           width=9, state="readonly")
-        hcb.pack(side="left", padx=(4, 12))
-        hcb.bind("<<ComboboxSelected>>", lambda e: self.refresh_list())
-        ttk.Label(opt, text="(lower = lighter; Original = full res)").pack(side="left")
-
-        ttk.Label(opt, text="   Codec:").pack(side="left")
-        self.codec_var = tk.StringVar(value=list(CODECS)[0])
-        ccb = ttk.Combobox(opt, textvariable=self.codec_var, values=list(CODECS),
-                           width=30, state="readonly")
-        ccb.pack(side="left", padx=4)
-        ccb.bind("<<ComboboxSelected>>", lambda e: self.refresh_list())
-
-        ttk.Label(opt, text="   At once:").pack(side="left")
-        default_par = max(1, min(3, (os.cpu_count() or 4) // 2))
-        self.parallel = tk.IntVar(value=default_par)
-        ttk.Spinbox(opt, from_=1, to=8, textvariable=self.parallel, width=4).pack(side="left", padx=4)
-
-        self.recurse = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt, text="include subfolders", variable=self.recurse,
-                        command=self.refresh_list).pack(side="left", padx=12)
-
-        opt2 = ttk.Frame(self.root)
-        opt2.pack(fill="x", padx=8, pady=2)
-        ttk.Label(opt2, text="Frame rate:").pack(side="left")
-        self.fps_var = tk.StringVar(value="Keep original")
-        fcb = ttk.Combobox(opt2, textvariable=self.fps_var,
-                           values=["Keep original", "30", "15"], width=14,
-                           state="readonly")
-        fcb.pack(side="left", padx=4)
-        fcb.bind("<<ComboboxSelected>>", lambda e: self.refresh_list())
-        ttk.Label(opt2,
-                  text="30/15 = lighter to PLAY in After Effects, but will NOT attach in Premiere",
-                  foreground="#b00000").pack(side="left", padx=6)
-        self.hwaccel = tk.BooleanVar(value=False)
-        ttk.Checkbutton(opt2, text="GPU decode", variable=self.hwaccel).pack(side="right")
-
-        btns = ttk.Frame(self.root)
-        btns.pack(fill="x", **pad)
-        self.start_btn = ttk.Button(btns, text="▶  START", command=self.on_start,
-                                    style="Big.TButton")
-        self.start_btn.pack(side="left")
-        self.stop_btn = ttk.Button(btns, text="■  Stop", command=self.on_stop, state="disabled")
-        self.stop_btn.pack(side="left", padx=6)
-        ttk.Button(btns, text="Open proxies folder", command=self.on_open).pack(side="left", padx=6)
-        ttk.Button(btns, text="Rescan", command=self.refresh_list).pack(side="left")
-
-        cols = ("size", "status", "prog")
-        self.tree = ttk.Treeview(self.root, columns=cols, show="tree headings", height=12)
-        self.tree.heading("#0", text="File")
-        self.tree.heading("size", text="Size")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("prog", text="Progress")
-        self.tree.column("#0", width=300, anchor="w")
-        self.tree.column("size", width=90, anchor="e")
-        self.tree.column("status", width=150, anchor="w")
-        self.tree.column("prog", width=250, anchor="w")
-        self.tree.tag_configure("done", foreground="#127a12")
-        self.tree.tag_configure("fail", foreground="#b00000")
-        self.tree.tag_configure("enc", foreground="#0a52a8")
-        self.tree.pack(fill="both", expand=True, padx=12, pady=4)
-
-        logbar = ttk.Frame(self.root)
-        logbar.pack(fill="x", padx=12, pady=(6, 0))
-        ttk.Label(logbar, text="Log:").pack(side="left")
-        ttk.Button(logbar, text="Copy for AI  (ChatGPT / Claude)",
-                   command=self.copy_for_ai).pack(side="right")
-        ttk.Button(logbar, text="Copy log", command=self.copy_log).pack(side="right", padx=6)
-
-        logwrap = ttk.Frame(self.root)
-        logwrap.pack(fill="x", padx=12, pady=(0, 4))
-        self.logbox = tk.Text(logwrap, height=8, wrap="word", font=("Consolas", 9))
-        sb = ttk.Scrollbar(logwrap, command=self.logbox.yview)
-        self.logbox.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self.logbox.pack(side="left", fill="both", expand=True)
-
-        bottom = ttk.Frame(self.root)
-        bottom.pack(fill="x", **pad)
-        self.overall = ttk.Progressbar(bottom, maximum=100, value=0)
-        self.overall.pack(fill="x", side="top", pady=(0, 5))
-        self.info_var = tk.StringVar(value="")
-        ttk.Label(bottom, textvariable=self.info_var,
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        self.status_var = tk.StringVar(value="Ready.  Pick a folder and press START.")
-        ttk.Label(bottom, textvariable=self.status_var,
-                  foreground="#666666").pack(anchor="w")
+        self.last_ckpt = None    # wall-clock of the last saved checkpoint
+        self.settings = default_settings()
+        self.folder = self.settings["folder"]
+        self.message = "Ready. Pick a folder and press Start."
+        self.finished_at = None  # wall-clock of the last run's end (UI shows a toast)
+        self.tools = tools_ok()
+        self._ffver = None
 
     # ---------- helpers ----------
     def outdir(self):
@@ -272,32 +182,40 @@ class App:
     def out_path_for(self, path, height, fps=None, codec=None):
         base = os.path.splitext(os.path.basename(path))[0]
         res = "full" if height == "Original" else f"{height}p"
-        ctag = CODEC_TAGS.get(codec, "")
-        ctag = f"_{ctag}" if ctag else ""
+        ctag = f"_{codec}" if codec in CODECS else ""
         ftag = f"_{fps}fps" if fps else ""
-        return os.path.join(self.outdir(), f"{base}_proxy_{res}{ctag}{ftag}.mov")
+        return os.path.join(self.folder, "proxies", f"{base}_proxy_{res}{ctag}{ftag}.mov")
 
-    def _fps_from_var(self):
-        v = self.fps_var.get()
-        return None if v.startswith("Keep") else int(v)
+    def _fps(self):
+        v = self.settings["fps"]
+        return None if v == "keep" else int(v)
 
     def log(self, msg):
-        line = time.strftime("%H:%M:%S ") + msg
+        now = time.time()
+        line = time.strftime("%H:%M:%S ", time.localtime(now)) + msg
         with self.lock:
-            self.loglines.append(line)
+            self.loglines.append((now, msg))
             try:
-                if self.logfile is None:
+                if self.logfile is None or self.logfile_dir != self.folder:
+                    if self.logfile is not None:
+                        self.logfile.close()
                     self.logfile = open(os.path.join(self.outdir(), "proxy_log.txt"),
                                         "a", encoding="utf-8")
+                    self.logfile_dir = self.folder
                 self.logfile.write(line + "\n")
                 self.logfile.flush()
             except Exception:
                 pass
 
+    def log_text(self, last=None):
+        with self.lock:
+            lines = self.loglines[-last:] if last else list(self.loglines)
+        return "\n".join(time.strftime("%H:%M:%S ", time.localtime(t)) + m for t, m in lines)
+
     def scan_files(self):
         folder = self.folder
         found = []
-        if self.recurse.get():
+        if self.settings["recurse"]:
             for root, dirs, names in os.walk(folder):
                 dirs[:] = [d for d in dirs if d.lower() != "proxies"]
                 for fn in names:
@@ -330,16 +248,22 @@ class App:
         return odur > 0
 
     # ---------- list ----------
-    def refresh_list(self):
+    def refresh_list(self, raw_settings=None):
+        """Apply settings and rescan. Returns an error string, or None."""
         if self.running:
-            return
-        self.folder = self.folder_var.get().strip() or self.folder
-        for iid in self.tree.get_children():
-            self.tree.delete(iid)
-        self.items.clear()
-        height = self.height_var.get()
-        fps = self._fps_from_var()
-        codec = self.codec_var.get()
+            return "A conversion is running. Stop it before changing settings."
+        s = clean_settings(raw_settings, self.settings)
+        if not os.path.isdir(s["folder"]):
+            with self.lock:
+                self.settings = s
+                self.items.clear()
+            self.message = "That folder does not exist."
+            return "That folder does not exist."
+        with self.lock:
+            self.settings = s
+            self.folder = s["folder"]
+        height, fps, codec = s["height"], self._fps(), s["codec"]
+        items = {}
         for path in self.scan_files():
             try:
                 size = os.path.getsize(path)
@@ -347,169 +271,51 @@ class App:
                 size = 0
             out = self.out_path_for(path, height, fps, codec)
             status = "done" if os.path.exists(out) else "pending"
-            it = {"path": path, "name": os.path.basename(path), "size": size,
-                  "dur": 0.0, "out": out, "audio": "copy",
-                  "status": status, "pct": 100 if status == "done" else 0,
-                  "speed": "", "err": ""}
-            self.items[path] = it
-            self.tree.insert("", "end", iid=path, text=it["name"],
-                             values=(human(size), status, ""))
-        n = len(self.items)
-        self.status_var.set(f"{n} video file(s) found in this folder."
-                            if n else "No video files in this folder. Click Browse…")
+            items[path] = {"path": path, "name": os.path.relpath(path, self.folder), "size": size,
+                           "dur": 0.0, "out": out, "audio": "copy",
+                           "status": status, "pct": 100 if status == "done" else 0,
+                           "speed": "", "err": ""}
+        with self.lock:
+            self.items = items
+        n = len(items)
+        self.message = (f"{n} video file(s) found in this folder." if n
+                        else "No video files in this folder.")
+        return None
 
     # ---------- run ----------
-    def on_browse(self):
-        d = filedialog.askdirectory(initialdir=self.folder)
-        if d:
-            self.folder_var.set(d)
-            self.folder = d
-            self.refresh_list()
-
-    def on_open(self):
-        try:
-            os.startfile(self.outdir())  # Windows
-        except Exception:
-            messagebox.showinfo(APP_TITLE, self.outdir())
-
-    # ---------- clipboard / AI help ----------
-    def _to_clip(self, text):
-        try:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-            self.root.update()  # keep clipboard contents after the window changes
-        except Exception:
-            pass
-
-    def copy_log(self):
-        with self.lock:
-            txt = "\n".join(self.loglines)
-        self._to_clip(txt or "(log is empty)")
-        self.status_var.set("Log copied to clipboard.")
-
-    def copy_for_ai(self):
-        self._to_clip(self.build_ai_context())
-        self.status_var.set("AI help text copied — paste it into ChatGPT or Claude.")
-        messagebox.showinfo(
-            APP_TITLE,
-            "Copied!\n\n"
-            "1) Open ChatGPT or Claude in your web browser.\n"
-            "2) Click the message box and paste with  Ctrl + V\n"
-            "3) Press Enter.\n\n"
-            "It already contains everything the AI needs to help you fix this.")
-
-    def _ffmpeg_version(self):
-        try:
-            p = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW)
-            return p.stdout.decode("utf-8", "replace").splitlines()[0]
-        except Exception:
-            return "ffmpeg: (version unknown)"
-
-    def build_ai_context(self):
-        """A self-contained help request, written TO an AI, for a non-technical user."""
-        import platform
-        with self.lock:
-            items = [(it["name"], human(it["size"]), it["status"], it.get("err", ""))
-                     for it in self.items.values()]
-            log = "\n".join(self.loglines[-80:])
-        failed = [x for x in items if x[2] == "FAILED"]
-
-        L = []
-        L.append("Hi! Please help me fix a problem. I am NOT technical, so please explain")
-        L.append("in simple, plain-language steps. If I need to type a command, give me the")
-        L.append("exact command and tell me where to paste it.")
-        L.append("")
-        L.append("Please answer in this order:")
-        L.append("  1) In ONE sentence, what went wrong.")
-        L.append("  2) Exact step-by-step instructions to fix it (simple words).")
-        L.append("  3) One short tip to avoid it next time.")
-        L.append("")
-        L.append("Here is everything about the program and what happened:")
-        L.append("============================================================")
-        L.append("PROGRAM: 'Proxy Maker' - a small Windows app (Python + ffmpeg).")
-        L.append("WHAT IT DOES: makes small, low-resolution PROXY copies of heavy video files")
-        L.append("so they play smoothly while editing in Adobe Premiere Pro / After Effects.")
-        L.append("")
-        L.append("HOW IT WORKS (so you can understand any error):")
-        L.append("- For each video it runs ffmpeg to (optionally) shrink the picture and re-encode")
-        L.append("  it as ProRes Proxy (default), ProRes 422 LT, or DNxHR LB, inside a .mov file.")
-        L.append("  With the 'Original' quality it keeps the full source resolution (full-res transcode).")
-        L.append("- The AUDIO is COPIED from the original unchanged and the frame rate is kept")
-        L.append("  the same; both MUST match the original or Premiere won't attach the proxy.")
-        L.append("- Crash-safe with CHECKPOINTS: each file is encoded in ~2-minute chunks saved")
-        L.append("  under proxies/.chunks/. A crash loses at most one chunk; re-running skips the")
-        L.append("  finished chunks. At the end the chunks are stitched together losslessly and")
-        L.append("  the ORIGINAL audio is copied in, then renamed to the final .mov.")
-        L.append("- It can convert several files at once (parallel).")
-        L.append("- If DNxHR LB fails on a frame, that file is AUTOMATICALLY re-tried with")
-        L.append("  ProRes Proxy, so one hard frame never blocks the whole run. This means")
-        L.append("  the proxies folder may contain a mix of DNxHR and ProRes files (both fine).")
-        L.append("")
-        L.append("THE ffmpeg COMMAND IT RUNS PER FILE (template):")
-        L.append("  ffmpeg -hide_banner -loglevel error -nostats -progress pipe:1 [-hwaccel auto]")
-        L.append('    -i "INPUT" -map 0:v:0 -map 0:a:0?')
-        L.append("    [-vf scale=-2:HEIGHT:flags=bilinear[,fps=N]]   (no scale when quality = Original)")
-        L.append("    -c:v prores_ks -profile:v 0 -pix_fmt yuv422p10le   (Proxy=0, 422 LT=1; or DNxHR: -c:v dnxhd -profile:v dnxhr_lb)")
-        L.append('    -c:a copy  (or: -c:a aac -b:a 192k)  -f mov -y "OUTPUT.mov.part"')
-        L.append("")
-        L.append("MY COMPUTER:")
-        L.append(f"  OS: {platform.platform()}")
-        L.append(f"  Python: {sys.version.split()[0]}")
-        L.append(f"  {self._ffmpeg_version()}")
-        L.append("")
-        L.append("SETTINGS I USED THIS TIME:")
-        L.append(f"  folder = {self.folder_var.get()}")
-        L.append(f"  quality(height) = {self.height_var.get()}    codec = {self.codec_var.get()}")
-        L.append(f"  convert at once = {self.parallel.get()}    frame rate = {self.fps_var.get()}")
-        L.append(f"  GPU decode = {bool(self.hwaccel.get())}    include subfolders = {bool(self.recurse.get())}")
-        L.append("")
-        if failed:
-            L.append(f"WHAT FAILED ({len(failed)} file(s)):")
-            for n, sz, st, er in failed:
-                L.append(f"  {n}  ({sz})")
-                if er:
-                    L.append(f"      ERROR: {er}")
-        else:
-            L.append("FILES AND STATUS:")
-            for n, sz, st, er in (items or [("(none found)", "", "", "")]):
-                L.append(f"  {n}  ({sz})  -> {st}")
-        L.append("")
-        L.append("FULL RECENT LOG:")
-        L.append(log or "  (the log is empty)")
-        L.append("============================================================")
-        L.append("Thank you!")
-        return "\n".join(L)
-
-    def on_start(self):
+    def start(self, raw_settings=None):
         if self.running:
-            return
-        self.folder = self.folder_var.get().strip() or self.folder
-        if not os.path.isdir(self.folder):
-            messagebox.showerror(APP_TITLE, "That folder does not exist.")
-            return
+            return "Already running."
+        err = self.refresh_list(raw_settings)
+        if err:
+            return err
         if not self.items:
-            self.refresh_list()
-            if not self.items:
-                return
+            return "No video files in this folder."
+        if not self.tools:
+            self.tools = tools_ok()
+            if not self.tools:
+                return "ffmpeg / ffprobe were not found on this PC."
+        s = self.settings
         self.running = True
+        self.finished_at = None
         self.cancel.clear()
-        self.start_btn.config(state="disabled")
-        self.stop_btn.config(state="normal")
-        height = self.height_var.get()
-        codec = self.codec_var.get()
-        vargs = CODECS[codec]
-        fps = self._fps_from_var()
-        hw = bool(self.hwaccel.get())
-        self.log(f"START folder={self.folder} height={height} codec={codec} "
-                 f"parallel={self.parallel.get()} fps={fps} gpu={hw}")
-        threading.Thread(target=self.controller, args=(height, vargs, fps, hw, codec), daemon=True).start()
+        with self.lock:
+            self.job_start = None
+            self.run_iids = set()
+        height, codec, fps, hw = s["height"], s["codec"], self._fps(), s["hwaccel"]
+        vargs = CODECS[codec][1]
+        self.message = "Checking files…"
+        self.log(f"START folder={self.folder} height={height} codec={CODECS[codec][0]} "
+                 f"parallel={s['parallel']} fps={fps} gpu={hw}")
+        threading.Thread(target=self.controller, args=(height, vargs, fps, hw, codec),
+                         daemon=True).start()
+        return None
 
-    def on_stop(self):
+    def stop(self):
         if not self.running:
             return
         self.cancel.set()
-        self.status_var.set("Stopping… (finishing current frames, then safe to close)")
+        self.message = "Stopping… finishing current frames, then it is safe to close."
         with self.lock:
             for proc in list(self.procs.values()):
                 try:
@@ -557,20 +363,26 @@ class App:
         with self.lock:
             self.job_start = time.time()
             self.run_iids = set(pending)
+        self.message = ("Converting… you can close this page any time and re-run later "
+                        "— finished files are kept.")
 
         try:
-            with ThreadPoolExecutor(max_workers=max(1, self.parallel.get())) as ex:
+            with ThreadPoolExecutor(max_workers=max(1, self.settings["parallel"])) as ex:
                 for iid in pending:
                     ex.submit(self.encode, iid, height, vargs, fps, hwaccel)
         except Exception as e:
             self.log(f"pool error: {e}")
 
         if self.cancel.is_set():
+            with self.lock:
+                for it in self.items.values():
+                    if it["status"] in ("queued", "checking…", "pending"):
+                        it["status"] = "stopped"
             self._finish("Stopped. Run again any time to continue where it left off.")
         else:
             fails = [it for it in self.items.values() if it["status"] == "FAILED"]
             if fails:
-                self._finish(f"Done, but {len(fails)} file(s) failed — see proxy_log.txt.")
+                self._finish(f"Done, but {len(fails)} file(s) failed — see the log.")
             else:
                 self._finish("All done. Proxies are in the 'proxies' subfolder.")
 
@@ -786,20 +598,19 @@ class App:
             pass
 
     def _finish(self, msg):
-        def done():
-            self.running = False
-            self.start_btn.config(state="normal")
-            self.stop_btn.config(state="disabled")
-            self.status_var.set(msg)
-        self.root.after(0, done)
+        self.log(msg)
+        self.message = msg
+        self.finished_at = time.time()
+        self.running = False
 
-    # ---------- periodic UI refresh ----------
-    def _tick(self):
+    # ---------- what the UI shows (was the 500 ms _tick) ----------
+    def snapshot(self, since=0):
         now = time.time()
         rows = []
         with self.lock:
             total = len(self.items)
             done = 0
+            failed = 0
             sum_pct = 0
             run_total = 0.0   # total seconds of video to process this run
             run_proc = 0.0    # seconds processed so far this run
@@ -807,87 +618,302 @@ class App:
                 st = it["status"]
                 pct = it["pct"]
                 dur = it.get("dur", 0) or 0
+                eta = None
                 if st.startswith("encoding"):
-                    eta = ""
                     t0 = it.get("t0")
                     if t0 and pct > 0:
-                        rem = (now - t0) * (100 - pct) / pct
-                        eta = "   ~" + fmt_dur(rem) + " left"
-                    extra = " (ProRes)" if "(" in st else ""
-                    friendly = "Converting" + extra
-                    detail = (f"{pct}%   {it['speed']}{eta}").strip()
-                    tag = "enc"
+                        eta = (now - t0) * (100 - pct) / pct
+                    key = "converting_fallback" if "(" in st else "converting"
                 elif st == "finishing":
-                    friendly, detail, tag = "Finishing (stitching)", f"{pct}%", "enc"
+                    key = "finishing"
                 elif st == "done":
-                    friendly, detail, tag = "Done", "", "done"
+                    key = "done"
                     done += 1
                 elif st == "FAILED":
-                    friendly, detail, tag = "Failed", it.get("err", "")[:60], "fail"
-                elif st in ("queued", "pending"):
-                    friendly, detail, tag = "Waiting", "", ""
+                    key = "failed"
+                    failed += 1
+                elif st == "queued":
+                    key = "waiting"
+                elif st == "pending":
+                    key = "pending"
                 elif st == "checking…":
-                    friendly, detail, tag = "Checking", "", ""
+                    key = "checking"
                 elif st == "no video":
-                    friendly, detail, tag = "No video (skipped)", "", ""
+                    key = "no_video"
                 elif st == "stopped":
-                    friendly, detail, tag = "Stopped", "", ""
+                    key = "stopped"
                 else:
-                    friendly, detail, tag = st, "", ""
-                rows.append((iid, friendly, detail, tag))
+                    key = st
+                rows.append({"id": iid, "name": it["name"], "size": it["size"],
+                             "status": key, "pct": pct, "speed": it.get("speed", ""),
+                             "eta": eta, "error": it.get("err", ""),
+                             "out": os.path.basename(it["out"])})
                 sum_pct += pct
                 if iid in self.run_iids:
                     run_total += dur
                     run_proc += dur * pct / 100.0
-            overall_val = (sum_pct / total) if total else 0
-            new_logs = self.loglines[self._log_index:]
-            self._log_index = len(self.loglines)
+            overall = (sum_pct / total) if total else 0
+            log = [{"id": i, "time": int(t * 1000), "message": m}
+                   for i, (t, m) in enumerate(self.loglines[since:], start=since)]
+            log_total = len(self.loglines)
             job_start = self.job_start
             last_ckpt = self.last_ckpt
-            running = self.running
+            settings = dict(self.settings)
 
-        for iid, friendly, detail, tag in rows:
-            if self.tree.exists(iid):
-                self.tree.set(iid, "status", friendly)
-                self.tree.set(iid, "prog", detail)
-                self.tree.item(iid, tags=(tag,) if tag else ())
-        self.overall["value"] = overall_val
-        for ln in new_logs:
-            self.logbox.insert("end", ln + "\n")
-        if new_logs:
-            self.logbox.see("end")
-
-        info = f"Files done:  {done} / {total}"
-        if running and job_start and run_total > 0:
+        finish_secs = None
+        if self.running and job_start and run_total > 0:
             elapsed = now - job_start
             if run_proc > 0 and elapsed > 1.5:
                 thru = run_proc / elapsed
-                rem_wall = (run_total - run_proc) / thru if thru > 0 else 0
-                clock = time.strftime("%H:%M", time.localtime(now + rem_wall))
-                info += f"      •      Estimated finish:  ~{fmt_dur(rem_wall)}  (around {clock})"
-            else:
-                info += "      •      Estimated finish:  calculating…"
-        if last_ckpt:
-            saved = time.strftime("%H:%M:%S", time.localtime(last_ckpt))
-            info += f"      •      Last saved:  {saved}  ({fmt_dur(now - last_ckpt)} ago)"
-        else:
-            info += "      •      Last saved:  (nothing finished yet)"
-        self.info_var.set(info)
+                finish_secs = (run_total - run_proc) / thru if thru > 0 else 0
+        return {
+            "running": self.running,
+            "stopping": self.running and self.cancel.is_set(),
+            "tools": self.tools,
+            "message": self.message,
+            "settings": settings,
+            "folderExists": os.path.isdir(settings["folder"]),
+            "files": rows,
+            "summary": {
+                "total": total, "done": done, "failed": failed,
+                "overall": round(overall, 1),
+                "finishSecs": finish_secs,
+                "finishAt": int((now + finish_secs) * 1000) if finish_secs is not None else None,
+                "lastSaved": int(last_ckpt * 1000) if last_ckpt else None,
+            },
+            "finishedAt": int(self.finished_at * 1000) if self.finished_at else None,
+            "log": log,
+            "logTotal": log_total,
+        }
 
-        if running:
-            self.status_var.set("Converting…   you can close this window any time and "
-                                "re-run later — finished files are kept.")
-        self.root.after(500, self._tick)
+    # ---------- AI help ----------
+    def _ffmpeg_version(self):
+        if self._ffver:
+            return self._ffver
+        try:
+            p = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, creationflags=CREATE_NO_WINDOW)
+            self._ffver = p.stdout.decode("utf-8", "replace").splitlines()[0]
+        except Exception:
+            return "ffmpeg: (version unknown)"
+        return self._ffver
+
+    def build_ai_context(self):
+        """A self-contained help request, written TO an AI, for a non-technical user."""
+        with self.lock:
+            items = [(it["name"], human(it["size"]), it["status"], it.get("err", ""))
+                     for it in self.items.values()]
+            s = dict(self.settings)
+        log = self.log_text(last=80)
+        failed = [x for x in items if x[2] == "FAILED"]
+
+        L = []
+        L.append("Hi! Please help me fix a problem. I am NOT technical, so please explain")
+        L.append("in simple, plain-language steps. If I need to type a command, give me the")
+        L.append("exact command and tell me where to paste it.")
+        L.append("")
+        L.append("Please answer in this order:")
+        L.append("  1) In ONE sentence, what went wrong.")
+        L.append("  2) Exact step-by-step instructions to fix it (simple words).")
+        L.append("  3) One short tip to avoid it next time.")
+        L.append("")
+        L.append("Here is everything about the program and what happened:")
+        L.append("============================================================")
+        L.append("PROGRAM: 'Proxy Maker' - a small app (Python + ffmpeg) with a page in the web browser.")
+        L.append("WHAT IT DOES: makes small, low-resolution PROXY copies of heavy video files")
+        L.append("so they play smoothly while editing in Adobe Premiere Pro / After Effects.")
+        L.append("")
+        L.append("HOW IT WORKS (so you can understand any error):")
+        L.append("- START.bat runs 'python make_proxies.py', which starts a small local web server")
+        L.append(f"  on http://{HOST}:{PORT} and opens the page in the browser.")
+        L.append("- For each video it runs ffmpeg to (optionally) shrink the picture and re-encode")
+        L.append("  it as ProRes Proxy (default), ProRes 422 LT, or DNxHR LB, inside a .mov file.")
+        L.append("  With the 'Original' quality it keeps the full source resolution (full-res transcode).")
+        L.append("- The AUDIO is COPIED from the original unchanged and the frame rate is kept")
+        L.append("  the same; both MUST match the original or Premiere won't attach the proxy.")
+        L.append("- Crash-safe with CHECKPOINTS: each file is encoded in ~2-minute chunks saved")
+        L.append("  under proxies/.chunks/. A crash loses at most one chunk; re-running skips the")
+        L.append("  finished chunks. At the end the chunks are stitched together losslessly and")
+        L.append("  the ORIGINAL audio is copied in, then renamed to the final .mov.")
+        L.append("- It can convert several files at once (parallel).")
+        L.append("- If DNxHR LB fails on a frame, that file is AUTOMATICALLY re-tried with")
+        L.append("  ProRes Proxy, so one hard frame never blocks the whole run. This means")
+        L.append("  the proxies folder may contain a mix of DNxHR and ProRes files (both fine).")
+        L.append("")
+        L.append("THE ffmpeg COMMAND IT RUNS PER FILE (template):")
+        L.append("  ffmpeg -hide_banner -loglevel error -nostats -progress pipe:1 [-hwaccel auto]")
+        L.append('    -i "INPUT" -map 0:v:0 -map 0:a:0?')
+        L.append("    [-vf scale=-2:HEIGHT:flags=bilinear[,fps=N]]   (no scale when quality = Original)")
+        L.append("    -c:v prores_ks -profile:v 0 -pix_fmt yuv422p10le   (Proxy=0, 422 LT=1; or DNxHR: -c:v dnxhd -profile:v dnxhr_lb)")
+        L.append('    -c:a copy  (or: -c:a aac -b:a 192k)  -f mov -y "OUTPUT.mov.part"')
+        L.append("")
+        L.append("MY COMPUTER:")
+        L.append(f"  OS: {platform.platform()}")
+        L.append(f"  Python: {sys.version.split()[0]}")
+        L.append(f"  {self._ffmpeg_version()}")
+        L.append("")
+        L.append("SETTINGS I USED THIS TIME:")
+        L.append(f"  folder = {s['folder']}")
+        L.append(f"  quality(height) = {s['height']}    codec = {CODECS[s['codec']][0]}")
+        L.append(f"  convert at once = {s['parallel']}    frame rate = "
+                 f"{'Keep original' if s['fps'] == 'keep' else s['fps']}")
+        L.append(f"  GPU decode = {s['hwaccel']}    include subfolders = {s['recurse']}")
+        L.append("")
+        if failed:
+            L.append(f"WHAT FAILED ({len(failed)} file(s)):")
+            for n, sz, st, er in failed:
+                L.append(f"  {n}  ({sz})")
+                if er:
+                    L.append(f"      ERROR: {er}")
+        else:
+            L.append("FILES AND STATUS:")
+            for n, sz, st, er in (items or [("(none found)", "", "", "")]):
+                L.append(f"  {n}  ({sz})  -> {st}")
+        L.append("")
+        L.append("FULL RECENT LOG:")
+        L.append(log or "  (the log is empty)")
+        L.append("============================================================")
+        L.append("Thank you!")
+        return "\n".join(L)
+
+    # ---------- desktop helpers ----------
+    def browse(self):
+        """Native folder picker in a helper process (the browser cannot give us a real path)."""
+        script = ("import sys, tkinter as tk\nfrom tkinter import filedialog\n"
+                  "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True)\n"
+                  "d = filedialog.askdirectory(initialdir=sys.argv[1], title='Pick the folder with your videos')\n"
+                  "sys.stdout.write(d or '')\n")
+        try:
+            p = subprocess.run([sys.executable, "-c", script, self.folder],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+        except Exception as e:
+            return None, f"The folder picker could not open ({e}). Type or paste the path instead."
+        if p.returncode != 0:
+            return None, "The folder picker is not available on this computer. Type or paste the path instead."
+        return os.path.normpath(p.stdout.decode("utf-8", "replace").strip()) or None, None
+
+    def open_outdir(self):
+        try:
+            d = self.outdir()
+        except Exception as e:
+            return f"Could not open the proxies folder: {e}"
+        try:
+            if os.name == "nt":
+                os.startfile(d)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", d])
+            else:
+                subprocess.Popen(["xdg-open", d], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            return f"Could not open the proxies folder ({e}). It is here: {d}"
+        return None
+
+
+ENGINE = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ProxyMaker"
+
+    def log_message(self, fmt, *args):   # keep the console quiet
+        pass
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(n).decode("utf-8"))
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/api/state":
+            try:
+                since = int(parse_qs(u.query).get("since", ["0"])[0])
+            except ValueError:
+                since = 0
+            return self._send(200, ENGINE.snapshot(since))
+        if u.path == "/api/help-text":
+            return self._send(200, {"text": ENGINE.build_ai_context()})
+        if u.path == "/api/log-text":
+            return self._send(200, {"text": ENGINE.log_text() or "(log is empty)"})
+        return self._static(u.path)
+
+    def do_POST(self):
+        u = urlparse(self.path)
+        body = self._body()
+        if u.path == "/api/scan":
+            err = ENGINE.refresh_list(body)
+            return self._send(200, {"error": err, "state": ENGINE.snapshot(0)})
+        if u.path == "/api/start":
+            err = ENGINE.start(body)
+            return self._send(200, {"error": err, "state": ENGINE.snapshot(0)})
+        if u.path == "/api/stop":
+            ENGINE.stop()
+            return self._send(200, {"error": None})
+        if u.path == "/api/browse":
+            folder, err = ENGINE.browse()
+            return self._send(200, {"folder": folder, "error": err})
+        if u.path == "/api/open":
+            return self._send(200, {"error": ENGINE.open_outdir()})
+        return self._send(404, {"error": "not found"})
+
+    def _static(self, path):
+        rel = path.lstrip("/") or "index.html"
+        full = os.path.normpath(os.path.join(WEBUI, rel))
+        if not full.startswith(WEBUI) or not os.path.isfile(full):
+            full = os.path.join(WEBUI, "index.html")
+        if not os.path.isfile(full):
+            return self._send(500, b"The web UI is missing (dist/index.html). Re-download Proxy Maker.",
+                              "text/plain; charset=utf-8")
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        with open(full, "rb") as f:
+            return self._send(200, f.read(), ctype)
+
+
+def already_running(url):
+    try:
+        with urllib.request.urlopen(url + "api/state", timeout=1.5) as r:
+            return r.status == 200
+    except Exception:
+        return False
 
 
 def main():
-    root = tk.Tk()
+    global ENGINE
+    url = f"http://{HOST}:{PORT}/"
+    if already_running(url):
+        print(f"Proxy Maker is already running — opening {url}")
+        webbrowser.open(url)
+        return
+    ENGINE = Engine()
+    if not ENGINE.tools:
+        print("WARNING: ffmpeg / ffprobe were not found. Install them:  winget install --id Gyan.FFmpeg -e")
+    ENGINE.refresh_list()
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    srv.daemon_threads = True
+    print(f"Proxy Maker is running at {url}")
+    print("Keep this window open while converting. Close it (or press Ctrl+C) to quit.")
+    if not os.environ.get("PROXY_MAKER_NO_BROWSER"):
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
     try:
-        ttk.Style().theme_use("vista")
-    except Exception:
+        srv.serve_forever()
+    except KeyboardInterrupt:
         pass
-    App(root)
-    root.mainloop()
+    finally:
+        ENGINE.stop()
+        srv.server_close()
 
 
 if __name__ == "__main__":
