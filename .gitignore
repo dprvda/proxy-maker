@@ -30,3 +30,8 @@ _chunktest/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Node / web UI
+node_modules/
+# dist/ is the prebuilt UI that make_proxies.py serves: committed so users never need Node.
+*.local
